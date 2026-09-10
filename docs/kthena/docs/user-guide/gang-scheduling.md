@@ -55,7 +55,7 @@ type GangPolicy struct {
 
 ## Queue Placement
 
-Volcano schedules every PodGroup through a [Queue](https://volcano.sh/en/docs/queue/). Kthena reads the queue name from the ModelServing object's own `metadata.annotations` — not from the pod template, as stock Volcano workloads do — and writes it into `PodGroup.spec.queue`.
+To place a ModelServing's PodGroups in a Volcano [Queue](https://volcano.sh/en/docs/queue/), set the `scheduling.volcano.sh/queue-name` annotation on the ModelServing itself, not on the pod template. Kthena copies it into `PodGroup.spec.queue`; without it, the PodGroup uses Volcano's `default` queue.
 
 ```yaml
 apiVersion: workload.serving.volcano.sh/v1alpha1
@@ -75,9 +75,7 @@ spec:
               nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
 ```
 
-- The annotation goes on the **ModelServing**, not on the pod template.
 - **Set it at creation.** On a running ModelServing the controller skips updates whose `spec` is unchanged, so an annotation edit alone takes effect only at the next reconcile (a spec change, a pod event, or a controller restart). Pods already bound to a node do not move.
-- **Remove it and the PodGroup falls back to Volcano's default queue.** Kthena writes an empty queue name and the PodGroup CRD defaults the field to `default`.
 - `nodeSelector`, `affinity` and `tolerations` are ordinary `corev1.PodSpec` fields, set per role on `entryTemplate.spec` or `workerTemplate.spec`.
 - **ModelBooster cannot set the queue annotation** — the ModelBooster controller does not propagate annotations onto the ModelServing it generates. For node targeting it exposes `spec.backend.workers[].affinity.nodeAffinity`, which does reach its pods.
 
