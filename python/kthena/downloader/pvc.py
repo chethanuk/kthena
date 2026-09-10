@@ -70,14 +70,17 @@ class PVCDownloader(ModelDownloader):
             bufsize=1
         )
 
-        # --progress turns every \r refresh into a line, so keep the tail deep
-        # enough that per-file errors survive until the exit-code summary.
+        # newline="" keeps each line's terminator, so a --progress refresh
+        # (ends in \r) is logged but kept out of the tail; otherwise thousands
+        # of refreshes push the real error line out before the exit code.
+        process.stdout.reconfigure(newline="")
         tail = collections.deque(maxlen=1000)
         for output in iter(process.stdout.readline, ''):
             line = output.strip()
             if line:
                 logger.info(line)
-                tail.append(line)
+                if not output.endswith("\r"):
+                    tail.append(line)
 
         process.stdout.close()
         return_code = process.wait()

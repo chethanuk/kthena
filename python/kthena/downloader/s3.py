@@ -58,12 +58,17 @@ class S3Downloader(ModelDownloader):
             bufsize=1
         )
 
+        # newline="" keeps each line's terminator, so a "Completed ..." progress
+        # refresh (ends in \r) is logged but kept out of the tail; otherwise
+        # thousands of refreshes push the real error line out before the exit code.
+        process.stdout.reconfigure(newline="")
         tail = collections.deque(maxlen=1000)
         for output in iter(process.stdout.readline, ''):
             line = output.strip()
             if line:
                 logger.info(line)
-                tail.append(line)
+                if not output.endswith("\r"):
+                    tail.append(line)
 
         process.stdout.close()
         return_code = process.wait()

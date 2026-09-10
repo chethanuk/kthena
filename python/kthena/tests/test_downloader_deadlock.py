@@ -81,6 +81,38 @@ class TestDownloaderPipeDeadlock(unittest.TestCase):
                 self.assertFalse(alive, f"{name} deadlocked on child stderr")
                 self.assertEqual(errs, [], f"{name} raised: {errs}")
 
+    def test_failure_message_keeps_error_line_despite_progress_refreshes(self):
+        # One real error line, then far more \r progress refreshes than the
+        # tail holds, then a non-zero exit -- the shape of rsync --progress
+        # (leading \r) and aws s3 sync (trailing \r) hitting a bad file.
+        error = "rsync: send_files failed to open /src/a: Permission denied (13)"
+        refreshes = {
+            "s3": "'Completed %d MiB/9 GiB (1 MiB/s) with 1 file(s) remaining\\r' % i",
+            "pvc": "'\\r  %d  50%%  1.00MB/s  0:00:01' % i",
+        }
+        real = subprocess.Popen
+
+        for name, run in CASES:
+            refresh = refreshes[name]
+            with self.subTest(name):
+                child = [
+                    sys.executable,
+                    "-c",
+                    "import sys\n"
+                    f"sys.stderr.write({error!r} + '\\n'); sys.stderr.flush()\n"
+                    f"for i in range(1500): sys.stdout.write({refresh})\n"
+                    "sys.stdout.write('\\n'); sys.exit(23)\n",
+                ]
+                with patch("subprocess.Popen", side_effect=lambda *a, **kw: real(child, **kw)), \
+                     patch("pathlib.Path.exists", return_value=True), \
+                     patch("pathlib.Path.is_dir", return_value=True), \
+                     patch("pathlib.Path.mkdir"), \
+                     self.assertRaises(Exception) as ctx:
+                    run()
+
+                # assertTrue, not assertIn: the miss case is ~1000 lines of progress
+                self.assertTrue(error in str(ctx.exception), "error line lost from failure tail")
+
 
 if __name__ == "__main__":
     unittest.main()
