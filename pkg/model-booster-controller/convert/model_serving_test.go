@@ -701,3 +701,68 @@ func TestBuildCacheVolume(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildModelServingNixlSideChannelHostUsesPodIP converts the shipped NIXL
+// prefill-decode examples and requires every container that ends up with
+// VLLM_NIXL_SIDE_CHANNEL_HOST to read it from the pod's own address. vLLM uses that one
+// value twice: it binds the NIXL side-channel listener on it and advertises it to the
+// peer engine as remote_host, so a literal wildcard makes the decode engine dial itself
+// and abort the handshake with an engine ID mismatch. The examples are read from the tree
+// instead of being copied into testdata/input precisely so that an example regressing to
+// a literal address fails here.
+func TestBuildModelServingNixlSideChannelHostUsesPodIP(t *testing.T) {
+	const sideChannelHost = "VLLM_NIXL_SIDE_CHANNEL_HOST"
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{
+			name: "example",
+			path: "../../../examples/model-booster/nixl-pd-disaggregation.yaml",
+		},
+		{
+			name: "docs copy of the example",
+			path: "../../../docs/kthena/docs/assets/examples/model-booster/nixl-pd-disaggregation.yaml",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			serving, err := BuildModelServing(loadYaml[workload.ModelBooster](t, tt.path))
+			require.NoError(t, err)
+			require.NotEmpty(t, serving.Spec.Template.Roles)
+
+			var carriers []string
+			for roleIndex := range serving.Spec.Template.Roles {
+				role := &serving.Spec.Template.Roles[roleIndex]
+				templates := []*workload.PodTemplateSpec{&role.EntryTemplate}
+				if role.WorkerTemplate != nil {
+					templates = append(templates, role.WorkerTemplate)
+				}
+				for _, template := range templates {
+					for containerIndex := range template.Spec.Containers {
+						container := &template.Spec.Containers[containerIndex]
+						for _, envVar := range container.Env {
+							if envVar.Name != sideChannelHost {
+								continue
+							}
+							carriers = append(carriers, role.Name+"/"+container.Name)
+							where := fmt.Sprintf("%s on %s/%s", sideChannelHost, role.Name, container.Name)
+							assert.Empty(t, envVar.Value, "%s must not be a literal address", where)
+							if assert.NotNil(t, envVar.ValueFrom, "%s must come from the downward API", where) &&
+								assert.NotNil(t, envVar.ValueFrom.FieldRef, "%s must use a field reference", where) {
+								assert.Equal(t, "status.podIP", envVar.ValueFrom.FieldRef.FieldPath, where)
+							}
+						}
+					}
+				}
+			}
+
+			// Both roles run the engine next to the runtime sidecar, and the sidecar
+			// receives the backend environment too, so the variable lands four times.
+			assert.ElementsMatch(t,
+				[]string{"prefill/runtime", "prefill/vllm", "decode/runtime", "decode/vllm"},
+				carriers)
+		})
+	}
+}
