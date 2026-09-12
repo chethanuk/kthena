@@ -767,8 +767,8 @@ func TestBuildModelServingNixlSideChannelHostUsesPodIP(t *testing.T) {
 }
 
 var (
-	// one "- name: VLLM_NIXL_SIDE_CHANNEL_HOST" line, the textual shape of a single stanza
-	nixlHostStanza = regexp.MustCompile(`(?m)^[ \t]*-[ \t]+name:[ \t]+VLLM_NIXL_SIDE_CHANNEL_HOST[ \t]*$`)
+	// one "- name: VLLM_NIXL_SIDE_CHANNEL_HOST" line, quoted or not, the textual shape of a stanza
+	nixlHostStanza = regexp.MustCompile(`(?m)^[ \t]*-[ \t]+name:[ \t]+["']?VLLM_NIXL_SIDE_CHANNEL_HOST["']?[ \t]*$`)
 	// the guides embed their manifests in a yaml fence or a "kubectl apply -f -" heredoc
 	nixlEmbeddedYAML = regexp.MustCompile("(?ms)^```yaml\n(.*?)^```$|^kubectl apply -f - <<'EOF'\n(.*?)^EOF$")
 )
