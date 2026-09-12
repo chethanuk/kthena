@@ -19,6 +19,10 @@ package convert
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -29,6 +33,7 @@ import (
 	"github.com/volcano-sh/kthena/pkg/model-booster-controller/env"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/yaml"
 )
 
 func TestGetMountPath(t *testing.T) {
@@ -702,14 +707,9 @@ func TestBuildCacheVolume(t *testing.T) {
 	}
 }
 
-// TestBuildModelServingNixlSideChannelHostUsesPodIP converts the shipped NIXL
-// prefill-decode examples and requires every container that ends up with
-// VLLM_NIXL_SIDE_CHANNEL_HOST to read it from the pod's own address. vLLM uses that one
-// value twice: it binds the NIXL side-channel listener on it and advertises it to the
-// peer engine as remote_host, so a literal wildcard makes the decode engine dial itself
-// and abort the handshake with an engine ID mismatch. The examples are read from the tree
-// instead of being copied into testdata/input precisely so that an example regressing to
-// a literal address fails here.
+// TestBuildModelServingNixlSideChannelHostUsesPodIP covers the conversion path: every container
+// BuildModelServing hands VLLM_NIXL_SIDE_CHANNEL_HOST must read it from status.podIP, so the pod
+// advertises its own address to the peer engine instead of a literal one.
 func TestBuildModelServingNixlSideChannelHostUsesPodIP(t *testing.T) {
 	const sideChannelHost = "VLLM_NIXL_SIDE_CHANNEL_HOST"
 
@@ -765,4 +765,114 @@ func TestBuildModelServingNixlSideChannelHostUsesPodIP(t *testing.T) {
 				carriers)
 		})
 	}
+}
+
+var (
+	// one "- name: VLLM_NIXL_SIDE_CHANNEL_HOST" line, the textual shape of a single stanza
+	nixlHostStanza = regexp.MustCompile(`(?m)^[ \t]*-[ \t]+name:[ \t]+VLLM_NIXL_SIDE_CHANNEL_HOST[ \t]*$`)
+	// the guides embed their manifests in a yaml fence or a "kubectl apply -f -" heredoc
+	nixlEmbeddedYAML = regexp.MustCompile("(?ms)^```yaml\n(.*?)^```$|^kubectl apply -f - <<'EOF'\n(.*?)^EOF$")
+)
+
+// TestNixlSideChannelHostShippedManifestsUsePodIP covers every shipped NIXL prefill-decode
+// manifest, including the ModelServing examples and the copies embedded in the guides, which the
+// conversion path never reads. vLLM binds the side-channel listener on
+// VLLM_NIXL_SIDE_CHANNEL_HOST and advertises that same value to the peer engine, so a literal
+// address makes the decode engine dial itself and abort the handshake with an engine ID mismatch.
+// The manifests are read from the tree rather than from testdata, which is what makes any of them
+// regressing to a literal address fail here.
+func TestNixlSideChannelHostShippedManifestsUsePodIP(t *testing.T) {
+	const fromPodIP = `{"name":"VLLM_NIXL_SIDE_CHANNEL_HOST","valueFrom":{"fieldRef":{"fieldPath":"status.podIP"}}}`
+
+	var manifests []string
+	for _, root := range []string{"../../../examples", "../../../docs/kthena"} {
+		require.NoError(t, filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				// Docusaurus mirrors the guides into gitignored output; only sources ship.
+				name := entry.Name()
+				if name == "node_modules" || name == "build" || strings.HasPrefix(name, ".") {
+					return fs.SkipDir
+				}
+				return nil
+			}
+			switch filepath.Ext(path) {
+			case ".yaml", ".yml", ".md":
+			default:
+				return nil
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			if nixlHostStanza.Match(data) {
+				manifests = append(manifests, path)
+			}
+			return nil
+		}))
+	}
+	require.NotEmpty(t, manifests, "no shipped manifest sets VLLM_NIXL_SIDE_CHANNEL_HOST")
+
+	for _, path := range manifests {
+		t.Run(path, func(t *testing.T) {
+			data, err := os.ReadFile(path)
+			require.NoError(t, err)
+
+			var checked int
+			for _, document := range nixlYAMLDocumentsIn(path, data) {
+				if !nixlHostStanza.Match(document) {
+					continue
+				}
+				var manifest any
+				require.NoError(t, yaml.Unmarshal(document, &manifest))
+				for _, envVar := range nixlEnvVarsNamed(manifest, "VLLM_NIXL_SIDE_CHANNEL_HOST") {
+					got, err := json.Marshal(envVar)
+					require.NoError(t, err)
+					assert.JSONEq(t, fromPodIP, string(got))
+					checked++
+				}
+			}
+			// Guards the extraction above: every stanza in the file must have been parsed.
+			require.Equal(t, len(nixlHostStanza.FindAll(data, -1)), checked,
+				"not every VLLM_NIXL_SIDE_CHANNEL_HOST stanza in this file was parsed")
+		})
+	}
+}
+
+// nixlYAMLDocumentsIn returns the YAML to parse for a shipped file: the file itself, or, for a
+// guide, each manifest embedded in it.
+func nixlYAMLDocumentsIn(path string, data []byte) [][]byte {
+	if filepath.Ext(path) != ".md" {
+		return [][]byte{data}
+	}
+	var documents [][]byte
+	for _, match := range nixlEmbeddedYAML.FindAllSubmatch(data, -1) {
+		document := match[1]
+		if len(document) == 0 {
+			document = match[2]
+		}
+		documents = append(documents, document)
+	}
+	return documents
+}
+
+// nixlEnvVarsNamed returns every container env entry called name anywhere in a parsed manifest.
+func nixlEnvVarsNamed(node any, name string) []map[string]any {
+	var found []map[string]any
+	switch value := node.(type) {
+	case map[string]any:
+		if got, ok := value["name"].(string); ok && got == name {
+			found = append(found, value)
+		}
+		for _, child := range value {
+			found = append(found, nixlEnvVarsNamed(child, name)...)
+		}
+	case []any:
+		for _, child := range value {
+			found = append(found, nixlEnvVarsNamed(child, name)...)
+		}
+	}
+	return found
 }
