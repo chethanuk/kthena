@@ -708,8 +708,7 @@ func TestBuildCacheVolume(t *testing.T) {
 }
 
 // TestBuildModelServingNixlSideChannelHostUsesPodIP covers the conversion path: every container
-// BuildModelServing hands VLLM_NIXL_SIDE_CHANNEL_HOST must read it from status.podIP, so the pod
-// advertises its own address to the peer engine instead of a literal one.
+// BuildModelServing hands VLLM_NIXL_SIDE_CHANNEL_HOST must read it from status.podIP.
 func TestBuildModelServingNixlSideChannelHostUsesPodIP(t *testing.T) {
 	const sideChannelHost = "VLLM_NIXL_SIDE_CHANNEL_HOST"
 
@@ -776,11 +775,8 @@ var (
 
 // TestNixlSideChannelHostShippedManifestsUsePodIP covers every shipped NIXL prefill-decode
 // manifest, including the ModelServing examples and the copies embedded in the guides, which the
-// conversion path never reads. vLLM binds the side-channel listener on
-// VLLM_NIXL_SIDE_CHANNEL_HOST and advertises that same value to the peer engine, so a literal
-// address makes the decode engine dial itself and abort the handshake with an engine ID mismatch.
-// The manifests are read from the tree rather than from testdata, which is what makes any of them
-// regressing to a literal address fail here.
+// conversion path never reads. Reading them from the tree rather than from testdata is what makes
+// one that regresses to a literal address fail here.
 func TestNixlSideChannelHostShippedManifestsUsePodIP(t *testing.T) {
 	const fromPodIP = `{"name":"VLLM_NIXL_SIDE_CHANNEL_HOST","valueFrom":{"fieldRef":{"fieldPath":"status.podIP"}}}`
 
