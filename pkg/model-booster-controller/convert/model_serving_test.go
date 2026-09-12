@@ -19,6 +19,10 @@ package convert
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -29,6 +33,7 @@ import (
 	"github.com/volcano-sh/kthena/pkg/model-booster-controller/env"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/yaml"
 )
 
 func TestGetMountPath(t *testing.T) {
@@ -700,4 +705,170 @@ func TestBuildCacheVolume(t *testing.T) {
 			assert.Equal(t, tt.expected, got)
 		})
 	}
+}
+
+// TestBuildModelServingNixlSideChannelHostUsesPodIP covers the conversion path: every container
+// BuildModelServing hands VLLM_NIXL_SIDE_CHANNEL_HOST must read it from status.podIP.
+func TestBuildModelServingNixlSideChannelHostUsesPodIP(t *testing.T) {
+	const sideChannelHost = "VLLM_NIXL_SIDE_CHANNEL_HOST"
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{
+			name: "example",
+			path: "../../../examples/model-booster/nixl-pd-disaggregation.yaml",
+		},
+		{
+			name: "docs copy of the example",
+			path: "../../../docs/kthena/docs/assets/examples/model-booster/nixl-pd-disaggregation.yaml",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			serving, err := BuildModelServing(loadYaml[workload.ModelBooster](t, tt.path))
+			require.NoError(t, err)
+			require.NotEmpty(t, serving.Spec.Template.Roles)
+
+			var carriers []string
+			for roleIndex := range serving.Spec.Template.Roles {
+				role := &serving.Spec.Template.Roles[roleIndex]
+				templates := []*workload.PodTemplateSpec{&role.EntryTemplate}
+				if role.WorkerTemplate != nil {
+					templates = append(templates, role.WorkerTemplate)
+				}
+				for _, template := range templates {
+					for containerIndex := range template.Spec.Containers {
+						container := &template.Spec.Containers[containerIndex]
+						for _, envVar := range container.Env {
+							if envVar.Name != sideChannelHost {
+								continue
+							}
+							carriers = append(carriers, role.Name+"/"+container.Name)
+							where := fmt.Sprintf("%s on %s/%s", sideChannelHost, role.Name, container.Name)
+							assert.Empty(t, envVar.Value, "%s must not be a literal address", where)
+							if assert.NotNil(t, envVar.ValueFrom, "%s must come from the downward API", where) &&
+								assert.NotNil(t, envVar.ValueFrom.FieldRef, "%s must use a field reference", where) {
+								assert.Equal(t, "status.podIP", envVar.ValueFrom.FieldRef.FieldPath, where)
+							}
+						}
+					}
+				}
+			}
+
+			// Both roles run the engine next to the runtime sidecar, and the sidecar
+			// receives the backend environment too, so the variable lands four times.
+			assert.ElementsMatch(t,
+				[]string{"prefill/runtime", "prefill/vllm", "decode/runtime", "decode/vllm"},
+				carriers)
+		})
+	}
+}
+
+var (
+	// one "- name: VLLM_NIXL_SIDE_CHANNEL_HOST" line, quoted or not, the textual shape of a stanza
+	nixlHostStanza = regexp.MustCompile(`(?m)^[ \t]*-[ \t]+name:[ \t]+["']?VLLM_NIXL_SIDE_CHANNEL_HOST["']?[ \t]*$`)
+	// the guides embed their manifests in a yaml fence or a "kubectl apply -f -" heredoc
+	nixlEmbeddedYAML = regexp.MustCompile("(?ms)^```yaml\n(.*?)^```$|^kubectl apply -f - <<'EOF'\n(.*?)^EOF$")
+)
+
+// TestNixlSideChannelHostShippedManifestsUsePodIP covers every shipped NIXL prefill-decode
+// manifest, including the ModelServing examples and the copies embedded in the guides, which the
+// conversion path never reads. Reading them from the tree rather than from testdata is what makes
+// one that regresses to a literal address fail here.
+func TestNixlSideChannelHostShippedManifestsUsePodIP(t *testing.T) {
+	const fromPodIP = `{"name":"VLLM_NIXL_SIDE_CHANNEL_HOST","valueFrom":{"fieldRef":{"fieldPath":"status.podIP"}}}`
+
+	var manifests []string
+	for _, root := range []string{"../../../examples", "../../../docs/kthena"} {
+		require.NoError(t, filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				// Docusaurus mirrors the guides into gitignored output; only sources ship.
+				name := entry.Name()
+				if name == "node_modules" || name == "build" || strings.HasPrefix(name, ".") {
+					return fs.SkipDir
+				}
+				return nil
+			}
+			switch filepath.Ext(path) {
+			case ".yaml", ".yml", ".md":
+			default:
+				return nil
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			if nixlHostStanza.Match(data) {
+				manifests = append(manifests, path)
+			}
+			return nil
+		}))
+	}
+	require.NotEmpty(t, manifests, "no shipped manifest sets VLLM_NIXL_SIDE_CHANNEL_HOST")
+
+	for _, path := range manifests {
+		t.Run(path, func(t *testing.T) {
+			data, err := os.ReadFile(path)
+			require.NoError(t, err)
+
+			var checked int
+			for _, document := range nixlYAMLDocumentsIn(path, data) {
+				if !nixlHostStanza.Match(document) {
+					continue
+				}
+				var manifest any
+				require.NoError(t, yaml.Unmarshal(document, &manifest))
+				for _, envVar := range nixlEnvVarsNamed(manifest, "VLLM_NIXL_SIDE_CHANNEL_HOST") {
+					got, err := json.Marshal(envVar)
+					require.NoError(t, err)
+					assert.JSONEq(t, fromPodIP, string(got))
+					checked++
+				}
+			}
+			// Guards the extraction above: every stanza in the file must have been parsed.
+			require.Equal(t, len(nixlHostStanza.FindAll(data, -1)), checked,
+				"not every VLLM_NIXL_SIDE_CHANNEL_HOST stanza in this file was parsed")
+		})
+	}
+}
+
+// nixlYAMLDocumentsIn returns the YAML to parse for a shipped file: the file itself, or, for a
+// guide, each manifest embedded in it.
+func nixlYAMLDocumentsIn(path string, data []byte) [][]byte {
+	if filepath.Ext(path) != ".md" {
+		return [][]byte{data}
+	}
+	var documents [][]byte
+	for _, match := range nixlEmbeddedYAML.FindAllSubmatch(data, -1) {
+		document := match[1]
+		if len(document) == 0 {
+			document = match[2]
+		}
+		documents = append(documents, document)
+	}
+	return documents
+}
+
+// nixlEnvVarsNamed returns every container env entry called name anywhere in a parsed manifest.
+func nixlEnvVarsNamed(node any, name string) []map[string]any {
+	var found []map[string]any
+	switch value := node.(type) {
+	case map[string]any:
+		if got, ok := value["name"].(string); ok && got == name {
+			found = append(found, value)
+		}
+		for _, child := range value {
+			found = append(found, nixlEnvVarsNamed(child, name)...)
+		}
+	case []any:
+		for _, child := range value {
+			found = append(found, nixlEnvVarsNamed(child, name)...)
+		}
+	}
+	return found
 }
