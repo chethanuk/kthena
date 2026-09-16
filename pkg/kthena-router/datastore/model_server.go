@@ -78,6 +78,15 @@ func (m *modelServer) categorizePodForPDGroup(podName types.NamespacedName, podL
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
+	// Drop any earlier filing first: the pod's labels, and so its group or
+	// role, may have changed since it was last categorized.
+	for name, pdGroupPods := range m.pdGroups {
+		pdGroupPods.RemovePod(podName)
+		if pdGroupPods.IsEmpty() {
+			delete(m.pdGroups, name)
+		}
+	}
+
 	pdGroupValue := m.getPDGroupName(podLabels)
 	if pdGroupValue == "" {
 		return

@@ -19,6 +19,8 @@ package datastore
 import (
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -282,5 +284,51 @@ func TestPDGroupPodRemoval(t *testing.T) {
 
 	if len(decodePods) != 0 {
 		t.Errorf("Expected 0 decode pods after deletion, got %d", len(decodePods))
+	}
+}
+
+// TestAddOrUpdatePodRelabelRefilesPDGroup verifies that relabeling a pod on the
+// same ModelServer moves it to its new PD group/role instead of leaving it filed
+// under the old one.
+func TestAddOrUpdatePodRelabelRefilesPDGroup(t *testing.T) {
+	tests := []struct {
+		name        string
+		before      map[string]string
+		after       map[string]string
+		wantDecode  []string
+		wantPrefill []string
+	}{
+		{"group value changes", map[string]string{"pd-group": "a", "role": "decode"}, map[string]string{"pd-group": "b", "role": "decode"}, []string{"p1"}, []string{}},
+		{"role flips prefill to decode", map[string]string{"pd-group": "a", "role": "prefill"}, map[string]string{"pd-group": "a", "role": "decode"}, []string{"p1"}, []string{}},
+		{"role flips decode to prefill", map[string]string{"pd-group": "a", "role": "decode"}, map[string]string{"pd-group": "a", "role": "prefill"}, []string{}, []string{"p1"}},
+		{"group and role both change", map[string]string{"pd-group": "a", "role": "prefill"}, map[string]string{"pd-group": "b", "role": "decode"}, []string{"p1"}, []string{}},
+		{"labels unchanged", map[string]string{"pd-group": "a", "role": "decode"}, map[string]string{"pd-group": "a", "role": "decode"}, []string{"p1"}, []string{}},
+		{"group key removed", map[string]string{"pd-group": "a", "role": "decode"}, map[string]string{"role": "decode"}, []string{}, []string{}},
+		{"role label removed", map[string]string{"pd-group": "a", "role": "decode"}, map[string]string{"pd-group": "a"}, []string{}, []string{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := New()
+			ms := newTestModelServerWithPDGroup("pd", "default")
+			require.NoError(t, s.AddOrUpdateModelServer(ms, nil))
+			tt.before["app"], tt.after["app"] = "pd", "pd"
+			require.NoError(t, s.AddOrUpdatePod(newTestPod("p1", "default", tt.before), []*aiv1alpha1.ModelServer{ms}))
+			require.NoError(t, s.AddOrUpdatePod(newTestPod("p1", "default", tt.after), []*aiv1alpha1.ModelServer{ms}))
+
+			msName := types.NamespacedName{Namespace: "default", Name: "pd"}
+			decode, err := s.GetDecodePods(msName)
+			require.NoError(t, err)
+			prefill, err := s.GetPrefillPods(msName)
+			require.NoError(t, err)
+			names := func(pods []*PodInfo) []string {
+				out := []string{}
+				for _, p := range pods {
+					out = append(out, p.GetPodNamespacedName().Name)
+				}
+				return out
+			}
+			assert.ElementsMatch(t, tt.wantDecode, names(decode), "decode pods")
+			assert.ElementsMatch(t, tt.wantPrefill, names(prefill), "prefill pods")
+		})
 	}
 }
